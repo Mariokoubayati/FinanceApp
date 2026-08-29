@@ -1,0 +1,63 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode user-specific state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# Build products and caches
+DerivedData/
+build/
+.build/
+*.hmap
+*.dSYM
+*.dSYM.zip
+*.xcarchive
+*.xcresult
+*.xccovarchive
+*.xccovreport
+*.ipa
+
+# Swift Package Manager local state
+.swiftpm/
+Packages/
+Package.pins
+
+# Local editor settings
+.idea/
+.vscode/
+.agents/
+.codex/
+*.swp
+*.swo
+*~
+*.orig
+
+# Local environment and signing credentials
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+Secrets.xcconfig
+*.secrets.xcconfig
+*.local.xcconfig
+
+# Automation runtime output (source under Automation/ remains tracked)
+*.log
+state.plist
+profile-backups/
+Automation/iOSRefresh/refresh-config.local.zsh
