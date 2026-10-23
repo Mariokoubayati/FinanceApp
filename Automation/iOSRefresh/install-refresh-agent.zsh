@@ -257,7 +257,7 @@ install_agent() {
 	bootstrap_agent
 
 	note "Installed and loaded ${LABEL}."
-	note "The RunAtLoad check has been requested; later checks run at 09:30, 13:30, 17:30, and 21:30 local time."
+	note "The RunAtLoad check has been requested; later checks run every 30 minutes while this Mac is awake."
 	note "Refresh log: ${LOG_DIR}/refresh.log"
 }
 
@@ -298,7 +298,7 @@ show_status() {
 		problems=1
 	fi
 	note "Refresh log: ${LOG_DIR}/refresh.log"
-	note "Schedule: at login and 09:30, 13:30, 17:30, and 21:30 local time"
+	note "Schedule: at login and every 30 minutes while this Mac is awake"
 
 	return "${problems}"
 }

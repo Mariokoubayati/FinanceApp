@@ -2,7 +2,7 @@
 
 This setup keeps the Personal Team build of `FinanceApp` available on the paired iPhone without publishing it. After the one-time installation, there is no routine Xcode work, App Store upload, IPA packaging, or **Run** button to remember.
 
-The per-user LaunchAgent starts a lightweight check at login and at 09:30, 13:30, 17:30, and 21:30 local time. The check exits without building while the installed provisioning profile has more than 48 hours remaining. Inside that window it renews the development signing, validates the new app and profile, installs the app on the intended phone, verifies the installation, and records the result. Scheduled renewals do not unexpectedly bring the app to the foreground; the supervised setup test launches it once. If the phone is temporarily unavailable, no success is recorded and the next scheduled check retries automatically.
+The per-user LaunchAgent starts a lightweight check at login and every 30 minutes while the Mac is awake. The check exits without building or querying the phone while the last verified installed provisioning profile has more than 48 hours remaining. Inside that window it requests a connection to the paired phone, renews the development signing, validates the new app and profile, installs the app, verifies the installation, and records the result. Scheduled renewals do not unexpectedly bring the app to the foreground; the supervised setup test launches it once. If the phone is temporarily unavailable, no success is recorded and the next scheduled check retries automatically.
 
 ## Unavoidable Apple constraints
 
@@ -10,7 +10,9 @@ The per-user LaunchAgent starts a lightweight check at login and at 09:30, 13:30
 - The signing keychain must be available to the logged-in user. Xcode must already be signed in to the Apple ID/Personal Team used by this project.
 - The iPhone must remain trusted and paired with Xcode, have Developer Mode enabled, and be reachable over its configured Wi-Fi connection or USB during at least one renewal attempt.
 - Xcode does not have to remain open after pairing. A new trust, Developer Mode, or unlock prompt from macOS/iOS still requires a person to accept it.
-- If the Mac and phone are never simultaneously available before the seven-day profile expires, no local automation can prevent that expiration. The four daily attempts provide multiple chances during the 48-hour renewal window.
+- If the Mac and phone are never simultaneously available before the seven-day profile expires, no local automation can prevent that expiration. Checks every 30 minutes provide multiple chances during the 48-hour renewal window.
+- Builds require at least 1 GB of free disk space. This is a minimum preflight check, not a guarantee for every Xcode build. The job discards its own disposable `~/Library/Caches/FinanceAppRefresh/DerivedData` after a verified renewal and before a build if space is low. A fresh-profile check also removes leftovers from a previous successful build. State, logs, profile backups, project source, and other applications' caches are preserved.
+- Warnings use macOS notifications. Allow notifications for the script runner if macOS requests it; Focus or notification settings can suppress their presentation.
 
 ## Files and retained data
 
@@ -42,7 +44,7 @@ Check the installed files and launchd registration:
 /bin/zsh /Users/koubayati/FinanceApp/Automation/iOSRefresh/install-refresh-agent.zsh status
 ```
 
-Check the app/profile/device view without changing anything:
+Check the app/profile/device view without rebuilding or installing (this can establish the phone connection):
 
 ```zsh
 /bin/zsh "$HOME/Library/Application Support/FinanceAppRefresh/bin/refresh-finance-app.zsh" --status
@@ -73,10 +75,20 @@ That command is normally a quick no-op while more than 48 hours remain. For a su
 ## Retry and troubleshooting behavior
 
 - A normal check that finds a fresh profile exits successfully without rebuilding.
-- An unavailable or locked phone, unavailable signing identity, failed package resolution, failed build, or failed validation does not advance the recorded successful state. The later calendar entries retry.
-- When the Mac sleeps through a calendar time, launchd can run the missed event after wake; multiple missed events may be coalesced. A powered-off or logged-out Mac cannot run a user LaunchAgent.
+- An idle, disconnected tunnel is not treated as proof that the phone is unreachable. The script makes up to two app-query connection attempts and checks the connected device's identity, pairing, and Developer Mode again. A successful device-list or cached-details response alone is not enough.
+- An unavailable or locked phone, low disk space, unavailable signing identity, failed package resolution, failed build, or failed validation does not advance the recorded successful state. Later interval checks retry.
+- Interval checks do not wake the Mac; attempts missed while asleep are not replayed. The next interval check after wake retries, and login triggers a check immediately. A powered-off or logged-out Mac cannot run a user LaunchAgent.
+- Failures warn after the second attempt, immediately for low disk space or a last verified profile within 24 hours of expiry, then at most daily for the same urgency. Reaching the 24-hour window or expiry triggers a fresh warning. Failed notification commands are retried. Notifications are attempted even when the disk is too full to save failure state.
+- Manual Xcode installs do not update this utility's state. Its recorded expiry can therefore be older than the phone's current profile; the next verified renewal updates that baseline. A cached profile is never assumed to have reached the phone.
 - `refresh.log` contains the concise decision and result. `xcodebuild.log` contains build details. Both are bounded by the refresh script rather than by launchd's standard-output file descriptors.
+- `device-connection.log` retains bounded diagnostic output from connection attempts, including failures hidden by the previous reachability check.
 - If `status` reports that the service is not loaded, rerun `install`. If device checks fail, open Xcode's Devices and Simulators window once and confirm that the same iPhone is trusted and available over the network.
+
+Run the isolated regression checks without contacting a phone or changing the installed agent:
+
+```zsh
+/usr/bin/python3 /Users/koubayati/FinanceApp/Automation/iOSRefresh/tests/test_refresh.py
+```
 
 ## Uninstall, preserve, or purge
 

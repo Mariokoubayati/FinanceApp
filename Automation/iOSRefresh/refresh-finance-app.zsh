@@ -31,10 +31,13 @@ typeset -r LOCK_DIR="${CACHE_ROOT}/run.lock"
 typeset -r LOG_DIR="${HOME}/Library/Logs/FinanceAppRefresh"
 typeset -r REFRESH_LOG="${LOG_DIR}/refresh.log"
 typeset -r BUILD_LOG="${LOG_DIR}/xcodebuild.log"
+typeset -r CONNECTION_LOG="${LOG_DIR}/device-connection.log"
 typeset -r PROFILE_DIR="${HOME}/Library/Developer/Xcode/UserData/Provisioning Profiles"
 typeset -r REFRESH_LEAD_SECONDS=172800
 typeset -r MIN_NEW_VALIDITY_SECONDS=518400
 typeset -r BUILD_TIMEOUT_SECONDS=2700
+typeset -r MIN_BUILD_FREE_KB=1048576
+typeset -r NOTICE_INTERVAL_SECONDS=86400
 
 typeset MODE="normal"
 typeset LAUNCH_AFTER_INSTALL="false"
@@ -46,6 +49,8 @@ typeset ATTEMPTED_REFRESH="false"
 typeset QUARANTINE_ACTIVE="false"
 typeset QUARANTINE_DIR=""
 typeset LAST_ERROR=""
+typeset DEVICE_ERROR=""
+typeset DEVICE_TUNNEL=""
 
 typeset CURRENT_PROFILE=""
 typeset CURRENT_UUID=""
@@ -114,8 +119,35 @@ prepare_runtime() {
 	ensure_private_directory "${CACHE_ROOT}"
 	ensure_private_directory "${DERIVED_DATA}"
 	ensure_private_directory "${LOG_DIR}"
+}
+
+prepare_work_area() {
 	TEMP_ROOT="$(/usr/bin/mktemp -d /private/tmp/financeapp-refresh.XXXXXX)" || \
-		die "could not create a temporary directory"
+		die "could not create a temporary directory; check the Mac's free disk space"
+}
+
+clear_refresh_build_cache() {
+	# This directory belongs exclusively to this job. The lock, installed
+	# script, state, logs and profile backups all live outside it.
+	[[ "${CACHE_ROOT}" == "${HOME}/Library/Caches/FinanceAppRefresh" && \
+		"${DERIVED_DATA}" == "${CACHE_ROOT}/DerivedData" && \
+		! -L "${DERIVED_DATA}" ]] || return 1
+	/bin/rm -rf -- "${DERIVED_DATA}" || return 1
+	log INFO "Removed this refresh job's disposable build cache."
+}
+
+check_disk_space() {
+	local available_kb
+	available_kb="$(/bin/df -Pk "${CACHE_ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
+	[[ "${available_kb}" == <-> ]] || die "could not determine free disk space for the refresh build"
+	if (( available_kb < MIN_BUILD_FREE_KB )); then
+		clear_refresh_build_cache || die "could not reclaim the refresh job's own build cache while disk space is low"
+		available_kb="$(/bin/df -Pk "${CACHE_ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
+		[[ "${available_kb}" == <-> ]] || die "could not determine free disk space after build-cache cleanup"
+	fi
+	(( available_kb >= MIN_BUILD_FREE_KB )) || \
+		die "low disk space: only $(( available_kb / 1024 )) MB free; free at least 1 GB on this Mac so FinanceApp can renew"
+	log INFO "Build disk-space check passed ($(( available_kb / 1024 )) MB free)."
 }
 
 setup_logging() {
@@ -204,9 +236,9 @@ find_matching_profiles() {
 	done
 }
 
-device_is_reachable() {
+read_device_connection() {
 	local output="${TEMP_ROOT}/devices.json"
-	local outcome identifier tunnel pairing developer_mode udid
+	local outcome identifier pairing developer_mode udid
 	/bin/rm -f "${output}" 2>/dev/null || true
 	/usr/bin/xcrun devicectl list devices \
 		--filter "identifier == '${CORE_DEVICE_ID}'" \
@@ -214,13 +246,42 @@ device_is_reachable() {
 	[[ -f "${output}" ]] || return 1
 	outcome="$(plist_raw "${output}" 'info.outcome')" || return 1
 	identifier="$(plist_raw "${output}" 'result.devices.0.identifier')" || return 1
-	tunnel="$(plist_raw "${output}" 'result.devices.0.connectionProperties.tunnelState')" || return 1
+	DEVICE_TUNNEL="$(plist_raw "${output}" 'result.devices.0.connectionProperties.tunnelState')" || return 1
 	pairing="$(plist_raw "${output}" 'result.devices.0.connectionProperties.pairingState')" || return 1
 	developer_mode="$(plist_raw "${output}" 'result.devices.0.deviceProperties.developerModeStatus')" || return 1
 	udid="$(plist_raw "${output}" 'result.devices.0.hardwareProperties.udid')" || return 1
 	[[ "${outcome}" == "success" && "${identifier}" == "${CORE_DEVICE_ID}" && \
-		"${tunnel}" == "connected" && "${pairing}" == "paired" && \
+		"${pairing}" == "paired" && \
 		"${developer_mode}" == "enabled" && "${udid}" == "${DEVICE_UDID}" ]]
+}
+
+device_is_reachable() {
+	DEVICE_ERROR="the intended iPhone was not found with matching pairing, identity, and Developer Mode; check Xcode's Devices window"
+	read_device_connection || return 1
+	[[ "${DEVICE_TUNNEL}" != "connected" ]] || return 0
+
+	# Listing devices only reports a snapshot. An app query actually requests a
+	# connection; unlike device details, it cannot succeed with cached data.
+	local probe="${TEMP_ROOT}/connection-probe.json"
+	local attempt outcome
+	rotate_log "${CONNECTION_LOG}" 1048576
+	DEVICE_ERROR="could not connect to the paired iPhone after two attempts; unlock it, connect by USB and accept any Trust prompt (details: ${CONNECTION_LOG})"
+	for attempt in 1 2; do
+		log INFO "Requesting a connection to the paired iPhone (attempt ${attempt}, previous tunnel=${DEVICE_TUNNEL})."
+		/bin/rm -f "${probe}" 2>/dev/null || true
+		if /usr/bin/xcrun devicectl device info apps \
+			--device "${CORE_DEVICE_ID}" --bundle-id "${BUNDLE_ID}" \
+			--timeout 45 --json-output "${probe}" >>"${CONNECTION_LOG}" 2>&1; then
+			outcome="$(plist_raw "${probe}" 'info.outcome')" || outcome=""
+			if [[ "${outcome}" == "success" ]] && read_device_connection && \
+				[[ "${DEVICE_TUNNEL}" == "connected" ]]; then
+				log INFO "Established and verified the connection to the intended iPhone."
+				return 0
+			fi
+		fi
+		(( attempt == 2 )) || /bin/sleep 3
+	done
+	return 1
 }
 
 quarantine_matching_profiles() {
@@ -366,21 +427,58 @@ write_success_state() {
 
 record_failure() {
 	local temporary="${STATE_FILE}.tmp.$$"
-	local failures=0
+	local failures=0 last_notice=0 last_urgency=-1 now urgency=0 message=""
+	local notice_sent="false"
+	now="$(/bin/date '+%s')"
+	if [[ -f "${STATE_FILE}" && ! -L "${STATE_FILE}" ]]; then
+		failures="$(plist_raw "${STATE_FILE}" 'ConsecutiveFailures' 2>/dev/null || print 0)"
+		last_notice="$(plist_raw "${STATE_FILE}" 'LastNotifiedAtEpoch' 2>/dev/null || print 0)"
+		last_urgency="$(plist_raw "${STATE_FILE}" 'LastNotifiedUrgency' 2>/dev/null || print 0)"
+	fi
+	[[ "${failures}" == <-> ]] || failures=0
+	[[ "${last_notice}" == <-> ]] || last_notice=0
+	[[ "${last_urgency}" == <-> ]] || last_urgency=-1
+	(( failures += 1 ))
+	if (( BASELINE_EXPIRATION_EPOCH > 0 )); then
+		if (( BASELINE_EXPIRATION_EPOCH <= now )); then
+			urgency=2
+			message="The last verified FinanceApp profile has expired. "
+		elif (( BASELINE_EXPIRATION_EPOCH - now <= 86400 )); then
+			urgency=1
+			message="FinanceApp expires within 24 hours. "
+		fi
+	fi
+	# Notify before writing state, so a full disk cannot hide the failure.
+	# Retry undelivered notifications and repeat daily or on expiry escalation.
+	if { (( failures >= 2 || urgency > 0 )) || [[ "${LAST_ERROR}" == *disk* ]]; } && \
+		(( last_notice == 0 || now - last_notice >= NOTICE_INTERVAL_SECONDS || urgency > last_urgency )); then
+		if /usr/bin/osascript - "${message}Renewal failed: ${LAST_ERROR:-unknown error}. Checks retry every 30 minutes while this Mac is awake." \
+			>/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+	display notification (item 1 of argv) with title "FinanceApp needs attention"
+end run
+APPLESCRIPT
+		then
+			notice_sent="true"
+		else
+			log WARN "macOS did not accept the renewal notification; the next failed check will retry it."
+		fi
+	fi
 	if [[ -f "${STATE_FILE}" && ! -L "${STATE_FILE}" ]]; then
 		/bin/cp "${STATE_FILE}" "${temporary}" 2>/dev/null || return 0
-		failures="$(plist_raw "${temporary}" 'ConsecutiveFailures' 2>/dev/null || print 0)"
 	else
 		/usr/bin/plutil -create xml1 "${temporary}" 2>/dev/null || return 0
 	fi
-	[[ "${failures}" == <-> ]] || failures=0
-	(( failures += 1 ))
 	plist_set_string "${temporary}" 'BundleIdentifier' "${BUNDLE_ID}" >/dev/null 2>&1 || return 0
 	plist_set_string "${temporary}" 'LastResult' 'failure' >/dev/null 2>&1 || return 0
 	plist_set_string "${temporary}" 'LastFailureAt' "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" >/dev/null 2>&1 || return 0
 	plist_set_string "${temporary}" 'LastFailureMessage' "${LAST_ERROR:-Refresh command failed}" >/dev/null 2>&1 || return 0
 	plist_set_integer "${temporary}" 'ConsecutiveFailures' "${failures}" >/dev/null 2>&1 || return 0
 	plist_set_bool "${temporary}" 'NeedsRetry' true >/dev/null 2>&1 || return 0
+	if [[ "${notice_sent}" == "true" ]]; then
+		plist_set_integer "${temporary}" 'LastNotifiedAtEpoch' "${now}" >/dev/null 2>&1 || return 0
+		plist_set_integer "${temporary}" 'LastNotifiedUrgency' "${urgency}" >/dev/null 2>&1 || return 0
+	fi
 	if [[ -n "${BASELINE_UUID}" && -n "${BASELINE_EXPIRATION}" ]]; then
 		plist_set_string "${temporary}" 'ProfileUUID' "${BASELINE_UUID}" >/dev/null 2>&1 || return 0
 		plist_set_string "${temporary}" 'ProfileCreationDate' "${BASELINE_CREATION}" >/dev/null 2>&1 || return 0
@@ -388,15 +486,6 @@ record_failure() {
 	fi
 	/bin/chmod 600 "${temporary}" 2>/dev/null || true
 	/bin/mv -f "${temporary}" "${STATE_FILE}" 2>/dev/null || return 0
-
-	if (( failures == 2 )); then
-		/usr/bin/osascript - "FinanceApp could not refresh twice. It will keep retrying automatically; see ${REFRESH_LOG}." \
-			>/dev/null 2>&1 <<'APPLESCRIPT' || true
-on run argv
-	display notification (item 1 of argv) with title "FinanceApp automatic refresh"
-end run
-APPLESCRIPT
-	fi
 }
 
 build_app() {
@@ -523,6 +612,7 @@ show_status() {
 		print -r -- "Paired iPhone reachable: yes"
 	else
 		print -r -- "Paired iPhone reachable: no"
+		print -r -- "Device check: ${DEVICE_ERROR}"
 	fi
 	if [[ -f "${STATE_FILE}" && ! -L "${STATE_FILE}" ]]; then
 		print -r -- "Recorded state:"
@@ -600,8 +690,13 @@ fi
 	exit 2
 }
 
+# Load the last verified expiry before any writes, including runtime setup.
+# Failures creating directories/temp files must also be recorded and notified.
+load_installed_baseline
+[[ "${MODE}" == "status" ]] || ATTEMPTED_REFRESH="true"
 prepare_runtime
 if [[ "${MODE}" == "status" ]]; then
+	prepare_work_area
 	show_status
 	exit 0
 fi
@@ -612,8 +707,6 @@ if ! acquire_lock; then
 fi
 
 [[ -d "${PROJECT}" ]] || die "Xcode project was not found: ${PROJECT}"
-find_matching_profiles
-load_installed_baseline
 typeset -i now remaining
 now="$(/bin/date '+%s')"
 remaining=$(( BASELINE_EXPIRATION_EPOCH - now ))
@@ -621,6 +714,9 @@ remaining=$(( BASELINE_EXPIRATION_EPOCH - now ))
 if [[ "${MODE}" == "normal" && "${STATE_NEEDS_RETRY}" != "true" && -n "${BASELINE_UUID}" ]] && \
 	(( remaining > REFRESH_LEAD_SECONDS )); then
 	log INFO "Installed profile ${BASELINE_UUID} remains valid until ${BASELINE_EXPIRATION}; no refresh is needed."
+	if [[ -d "${DERIVED_DATA}/Build" ]]; then
+		clear_refresh_build_cache || log WARN "Could not remove the previous refresh build cache."
+	fi
 	exit 0
 fi
 
@@ -631,7 +727,10 @@ else
 	log INFO "No verified installed-profile baseline exists; a verified installation is required."
 fi
 
-device_is_reachable || die "the paired iPhone is not currently reachable; a later scheduled check will retry"
+check_disk_space
+prepare_work_area
+find_matching_profiles
+device_is_reachable || die "${DEVICE_ERROR}; a later scheduled check will retry"
 log INFO "The intended paired iPhone is connected and Developer Mode is enabled."
 
 typeset reuse_pending_profile="false"
@@ -656,5 +755,6 @@ write_success_state
 QUARANTINE_ACTIVE="false"
 log INFO "Automatic refresh completed successfully; the new profile expires ${NEW_EXPIRATION}."
 launch_app_if_requested
+clear_refresh_build_cache || log WARN "Refresh succeeded, but its disposable build cache could not be removed."
 
 exit 0
