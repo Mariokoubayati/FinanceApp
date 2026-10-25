@@ -181,6 +181,7 @@ alter table public.accounts      enable row level security;
 alter table public.categories    enable row level security;
 alter table public.transactions  enable row level security;
 alter table public.savings_goals enable row level security;
+alter table public.budgets       enable row level security;
 
 -- profiles
 create policy "profiles_all" on public.profiles for all
@@ -213,5 +214,10 @@ create policy "transactions_all" on public.transactions for all
 
 -- savings goals
 create policy "savings_goals_all" on public.savings_goals for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- budgets
+create policy "budgets_all" on public.budgets for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
